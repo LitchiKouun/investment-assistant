@@ -1,0 +1,52 @@
+investment-research-agent/
+├── frontend/                    # Vue3 前端项目
+│   ├── public/
+│   ├── src/
+│   │   ├── api/                 # 与后端通信的 API 封装
+│   │   ├── components/          # 通用组件
+│   │   │   ├── chat/            # 对话相关组件
+│   │   │   ├── charts/          # 图表组件
+│   │   │   └── report/          # 研报展示组件
+│   │   ├── composables/         # 组合式函数（useChat, useReport）
+│   │   ├── stores/              # Pinia 状态管理
+│   │   ├── views/               # 页面
+│   │   ├── types/               # TypeScript 类型定义
+│   │   └── App.vue
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── tsconfig.json
+│
+├── backend/                     # FastAPI 后端项目
+│   ├── app/
+│   │   ├── api/                 # 路由定义
+│   │   │   ├── v1/
+│   │   │   │   ├── chat.py      # 对话接口
+│   │   │   │   └── report.py    # 报告接口
+│   │   │   └── deps.py          # 依赖注入（获取 Agent 等）
+│   │   ├── core/                # 核心配置
+│   │   │   ├── config.py        # 环境配置（Pydantic Settings）
+│   │   │   └── logging.py
+│   │   ├── agent/               # LangChain Agent 核心
+│   │   │   ├── agent.py         # Agent 创建与配置
+│   │   │   ├── tools/           # 自定义工具集
+│   │   │   │   ├── financial_data.py
+│   │   │   │   ├── news_search.py
+│   │   │   │   ├── database_query.py
+│   │   │   │   └── chart_generator.py
+│   │   │   ├── prompts/         # Prompt 模板
+│   │   │   └── memory/          # 会话记忆管理
+│   │   ├── services/            # 业务逻辑层
+│   │   │   ├── chat_service.py
+│   │   │   └── report_service.py
+│   │   ├── models/              # SQLAlchemy / Pydantic 模型
+│   │   │   ├── domain/          # 数据库模型
+│   │   │   └── schemas/         # 请求/响应 Pydantic 模型
+│   │   └── db/                  # 数据库连接与迁移
+│   ├── tests/
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .env
+│
+├── data/                        # 本地数据文件夹（可选）
+├── docker-compose.yml           # 整体部署编排
+└── README.md
