@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 from typing import List
+
+_BACKEND_DIR = Path(__file__).resolve().parent
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -28,6 +30,9 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     chunk_overlap: int = 50
     top_k_retrieval: int = 3
+
+    # 对话存储（SQLite）
+    conversation_db_path: Path = _BACKEND_DIR / "data" / "conversations.db"
 
     #  BaseSettings 会自动从环境变量或 .env 文件中读取对应名称的值 不需要手动调用 os.getenv()
     class Config:

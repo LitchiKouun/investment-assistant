@@ -40,7 +40,6 @@ def get_current_datetime() -> str:
     print('=' * 30)
     return result
 
-
 @tool
 def search_knowledge_base(query: str) -> str:
     """从知识库中检索与投资相关的信息"""

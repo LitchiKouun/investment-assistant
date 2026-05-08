@@ -1,34 +1,83 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
-const createSession = (title = '新会话') => ({
-  id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-  title,
-  messages: [],
-})
+const API_BASE = 'http://127.0.0.1:8000'
 
-const sessions = ref([createSession('市场分析')])
-const activeSessionId = ref(sessions.value[0].id)
+const sessions = ref([])
+const activeSessionId = ref('')
 const inputText = ref('')
 const loading = ref(false)
+const bootError = ref('')
 
 const activeSession = computed(() =>
   sessions.value.find((session) => session.id === activeSessionId.value),
 )
 
-const switchSession = (sessionId) => {
+const mapMessage = (m) => ({
+  id: m.id,
+  role: m.role,
+  content: m.content,
+})
+
+async function fetchJson(path, options = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options,
+  })
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      const body = await res.json()
+      if (body?.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail || '请求失败')
+  }
+  if (res.status === 204) return null
+  return res.json()
+}
+
+async function refreshConversationList() {
+  const rows = await fetchJson('/conversations')
+  sessions.value = rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    message_count: r.message_count,
+    messages: [],
+  }))
+}
+
+async function loadConversationDetail(sessionId) {
+  const detail = await fetchJson(`/conversations/${sessionId}`)
+  const s = sessions.value.find((x) => x.id === sessionId)
+  if (!s) return
+  s.title = detail.title
+  s.message_count = detail.messages?.length ?? 0
+  s.messages = (detail.messages || []).map(mapMessage)
+}
+
+const switchSession = async (sessionId) => {
   activeSessionId.value = sessionId
+  try {
+    await loadConversationDetail(sessionId)
+  } catch (e) {
+    bootError.value = e.message || String(e)
+  }
 }
 
-const newSession = () => {
-  const session = createSession()
-  sessions.value.unshift(session)
-  activeSessionId.value = session.id
-}
-
-const updateSessionTitle = (session, fallbackTitle) => {
-  if (session.title === '新会话') {
-    session.title = fallbackTitle.slice(0, 12) || '新会话'
+const newSession = async () => {
+  try {
+    bootError.value = ''
+    const detail = await fetchJson('/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ title: '新会话' }),
+    })
+    await refreshConversationList()
+    activeSessionId.value = detail.id
+    await loadConversationDetail(detail.id)
+  } catch (e) {
+    bootError.value = e.message || String(e)
   }
 }
 
@@ -37,35 +86,27 @@ const sendMessage = async () => {
   if (!text || loading.value || !activeSession.value) return
 
   const currentSession = activeSession.value
+  const convId = currentSession.id
+
   currentSession.messages.push({
+    id: `local-${Date.now()}`,
     role: 'user',
     content: text,
   })
-  updateSessionTitle(currentSession, text)
+  currentSession.message_count = (currentSession.message_count || 0) + 1
   inputText.value = ''
 
   loading.value = true
   try {
-    const res = await fetch('http://127.0.0.1:8000/analyze', {
+    await fetchJson(`/conversations/${convId}/messages`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query: text }),
+      body: JSON.stringify({ content: text }),
     })
-
-    if (!res.ok) {
-      const errData = await res.json()
-      throw new Error(errData.detail || '请求失败')
-    }
-
-    const data = await res.json()
-    currentSession.messages.push({
-      role: 'assistant',
-      content: data.result || '暂无返回结果',
-    })
+    await refreshConversationList()
+    await loadConversationDetail(convId)
   } catch (err) {
     currentSession.messages.push({
+      id: `local-err-${Date.now()}`,
       role: 'assistant',
       content: `发生错误：${err.message || '未知错误'}`,
     })
@@ -73,6 +114,30 @@ const sendMessage = async () => {
     loading.value = false
   }
 }
+
+onMounted(async () => {
+  try {
+    bootError.value = ''
+    let rows = await fetchJson('/conversations')
+    if (!rows.length) {
+      await fetchJson('/conversations', {
+        method: 'POST',
+        body: JSON.stringify({ title: '市场分析' }),
+      })
+      rows = await fetchJson('/conversations')
+    }
+    sessions.value = rows.map((r) => ({
+      id: r.id,
+      title: r.title,
+      message_count: r.message_count,
+      messages: [],
+    }))
+    activeSessionId.value = rows[0].id
+    await loadConversationDetail(rows[0].id)
+  } catch (e) {
+    bootError.value = e.message || String(e)
+  }
+})
 </script>
 
 <template>
@@ -87,7 +152,7 @@ const sendMessage = async () => {
             @click="switchSession(session.id)"
           >
             <span class="session-title">{{ session.title }}</span>
-            <span class="session-meta">{{ session.messages.length }} 条消息</span>
+            <span class="session-meta">{{ session.message_count ?? session.messages.length }} 条消息</span>
           </button>
         </li>
       </ul>
@@ -96,13 +161,14 @@ const sendMessage = async () => {
     <main class="chat-main">
       <div class="chat-header">
         <h1>{{ activeSession?.title || '智能助手' }}</h1>
+        <p v-if="bootError" class="boot-error">{{ bootError }}</p>
       </div>
 
       <div class="chat-body">
         <template v-if="activeSession && activeSession.messages.length">
           <div
             v-for="(msg, idx) in activeSession.messages"
-            :key="idx"
+            :key="msg.id"
             class="message"
             :class="msg.role"
           >
@@ -207,18 +273,28 @@ const sendMessage = async () => {
 }
 
 .chat-header {
-  height: 64px;
+  min-height: 64px;
   border-bottom: 1px solid #e5e7eb;
   background: #fff;
   display: flex;
   align-items: center;
-  padding: 0 20px;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 20px;
 }
 
 .chat-header h1 {
   margin: 0;
   font-size: 18px;
   color: #111827;
+}
+
+.boot-error {
+  margin: 0 0 0 16px;
+  font-size: 13px;
+  color: #b91c1c;
+  flex: 1;
+  min-width: 0;
 }
 
 .chat-body {
