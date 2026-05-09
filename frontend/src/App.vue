@@ -1,13 +1,24 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 
 const API_BASE = 'http://127.0.0.1:8000'
+
+marked.setOptions({ breaks: true, gfm: true })
+
+function renderAssistantMarkdown(text) {
+  if (!text) return ''
+  const html = marked(String(text), { async: false })
+  return DOMPurify.sanitize(typeof html === 'string' ? html : String(html))
+}
 
 const sessions = ref([])
 const activeSessionId = ref('')
 const inputText = ref('')
 const loading = ref(false)
 const bootError = ref('')
+const chatBodyRef = ref(null)
 
 const activeSession = computed(() =>
   sessions.value.find((session) => session.id === activeSessionId.value),
@@ -81,6 +92,12 @@ const newSession = async () => {
   }
 }
 
+async function scrollChatToBottom() {
+  await nextTick()
+  const el = chatBodyRef.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
 const sendMessage = async () => {
   const text = inputText.value.trim()
   if (!text || loading.value || !activeSession.value) return
@@ -88,30 +105,98 @@ const sendMessage = async () => {
   const currentSession = activeSession.value
   const convId = currentSession.id
 
-  currentSession.messages.push({
+  inputText.value = ''
+  loading.value = true
+
+  const userMsg = {
     id: `local-${Date.now()}`,
     role: 'user',
     content: text,
-  })
-  currentSession.message_count = (currentSession.message_count || 0) + 1
-  inputText.value = ''
+  }
+  const assistantMsg = {
+    id: `local-asst-${Date.now()}`,
+    role: 'assistant',
+    content: '',
+    streaming: true,
+  }
+  let didStartStream = false
 
-  loading.value = true
   try {
-    await fetchJson(`/conversations/${convId}/messages`, {
+    const res = await fetch(`${API_BASE}/conversations/${convId}/messages`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: text }),
     })
-    await refreshConversationList()
-    await loadConversationDetail(convId)
+    if (!res.ok) {
+      let detail = res.statusText
+      try {
+        const body = await res.json()
+        if (body?.detail) detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+      } catch {
+        /* ignore */
+      }
+      throw new Error(detail || '请求失败')
+    }
+
+    currentSession.messages.push(userMsg)
+    currentSession.message_count = (currentSession.message_count || 0) + 1
+    currentSession.messages.push(assistantMsg)
+    didStartStream = true
+
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('无法读取响应流')
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        let evt
+        try {
+          evt = JSON.parse(trimmed)
+        } catch {
+          continue
+        }
+        if (evt.type === 'delta' && typeof evt.text === 'string') {
+          assistantMsg.content += evt.text
+          void scrollChatToBottom()
+        } else if (evt.type === 'error') {
+          const m = typeof evt.message === 'string' ? evt.message : JSON.stringify(evt.message)
+          assistantMsg.content += assistantMsg.content ? `\n\n错误：${m}` : `发生错误：${m}`
+        }
+      }
+    }
+    assistantMsg.streaming = false
   } catch (err) {
-    currentSession.messages.push({
-      id: `local-err-${Date.now()}`,
-      role: 'assistant',
-      content: `发生错误：${err.message || '未知错误'}`,
-    })
+    if (currentSession.messages.includes(assistantMsg)) {
+      assistantMsg.streaming = false
+      assistantMsg.content =
+        assistantMsg.content ||
+        `发生错误：${err?.message || String(err)}`
+    } else {
+      currentSession.messages.push({
+        id: `local-err-${Date.now()}`,
+        role: 'assistant',
+        content: `发生错误：${err?.message || String(err)}`,
+      })
+    }
   } finally {
     loading.value = false
+    if (didStartStream) {
+      try {
+        await refreshConversationList()
+        await loadConversationDetail(convId)
+      } catch {
+        /* ignore sync errors */
+      }
+    }
+    void scrollChatToBottom()
   }
 }
 
@@ -164,10 +249,10 @@ onMounted(async () => {
         <p v-if="bootError" class="boot-error">{{ bootError }}</p>
       </div>
 
-      <div class="chat-body">
+      <div ref="chatBodyRef" class="chat-body">
         <template v-if="activeSession && activeSession.messages.length">
           <div
-            v-for="(msg, idx) in activeSession.messages"
+            v-for="msg in activeSession.messages"
             :key="msg.id"
             class="message"
             :class="msg.role"
@@ -175,7 +260,16 @@ onMounted(async () => {
             <div class="message-role">
               {{ msg.role === 'user' ? '你' : 'AI' }}
             </div>
-            <div class="message-content">{{ msg.content }}</div>
+            <div
+              v-if="msg.role === 'user'"
+              class="message-content"
+            >{{ msg.content }}</div>
+            <div
+              v-else
+              class="message-content markdown-body"
+              v-html="renderAssistantMarkdown(msg.content)"
+            />
+            <div v-if="msg.role === 'assistant' && msg.streaming" class="stream-cursor" aria-hidden="true" />
           </div>
         </template>
         <div v-else class="empty-tip">
@@ -312,6 +406,111 @@ onMounted(async () => {
   border-radius: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
+  position: relative;
+}
+
+.message :deep(.markdown-body) {
+  white-space: normal;
+}
+
+.message :deep(.markdown-body h1),
+.message :deep(.markdown-body h2),
+.message :deep(.markdown-body h3) {
+  margin: 0.6em 0 0.35em;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.message :deep(.markdown-body h1) {
+  font-size: 1.25rem;
+}
+
+.message :deep(.markdown-body h2) {
+  font-size: 1.1rem;
+}
+
+.message :deep(.markdown-body h3) {
+  font-size: 1rem;
+}
+
+.message :deep(.markdown-body p) {
+  margin: 0.4em 0;
+}
+
+.message :deep(.markdown-body p:first-child) {
+  margin-top: 0;
+}
+
+.message :deep(.markdown-body p:last-child) {
+  margin-bottom: 0;
+}
+
+.message :deep(.markdown-body ul),
+.message :deep(.markdown-body ol) {
+  margin: 0.35em 0;
+  padding-left: 1.25rem;
+}
+
+.message :deep(.markdown-body code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.message :deep(.markdown-body pre) {
+  margin: 0.5em 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: #f3f4f6;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.message :deep(.markdown-body pre code) {
+  background: none;
+  padding: 0;
+}
+
+.message :deep(.markdown-body blockquote) {
+  margin: 0.5em 0;
+  padding-left: 0.75em;
+  border-left: 3px solid #d1d5db;
+  color: #4b5563;
+}
+
+.message :deep(.markdown-body table) {
+  border-collapse: collapse;
+  font-size: 13px;
+  margin: 0.5em 0;
+}
+
+.message :deep(.markdown-body th),
+.message :deep(.markdown-body td) {
+  border: 1px solid #e5e7eb;
+  padding: 6px 8px;
+}
+
+.message :deep(.markdown-body th) {
+  background: #f9fafb;
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 6px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: #3763ff;
+  border-radius: 1px;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
 }
 
 .message.user {

@@ -1,10 +1,8 @@
 import json
-from typing import Dict, Any, List
+from typing import Any, Iterator
 from backend.config import get_settings
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from . import tools
 
 # 角色：意图分析与信息提取 Agent（智能投研助手 · 一号Agent）
@@ -250,19 +248,72 @@ def format_agent2_input(data: dict) -> dict:
     }
 
 
-# 使用 LCEL 构建完整的分析链
-analysis_chain = (
-    # 第一步：用户输入传递给Agent1
-        RunnablePassthrough()
-        | RunnableLambda(lambda x: {
-    "messages": [{"role": "user", "content": x}]
-})
-        | agent1
-        | RunnableLambda(parse_agent1_output)
-        | RunnableLambda(format_agent2_input)
-        | agent2
-        | RunnableLambda(lambda x: x["messages"][-1].content)
-)
+def run_agent1_pipeline(user_query: str) -> dict[str, Any]:
+    """Agent1 → 解析 → 组装 Agent2 输入（阻塞阶段，无流式）。"""
+    agent1_input: dict[str, Any] = {
+        "messages": [{"role": "user", "content": user_query}],
+    }
+    r1 = agent1.invoke(agent1_input)
+    parsed = parse_agent1_output(r1)
+    return format_agent2_input(parsed)
+
+
+def _text_from_message_chunk(token: Any) -> str:
+    blocks = getattr(token, "content_blocks", None)
+    if blocks:
+        parts: list[str] = []
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text")
+                if t:
+                    parts.append(str(t))
+        if parts:
+            return "".join(parts)
+    content = getattr(token, "content", None)
+    if isinstance(content, str) and content:
+        return content
+    if isinstance(content, list):
+        parts = []
+        for x in content:
+            if isinstance(x, dict) and x.get("type") == "text":
+                parts.append(str(x.get("text", "")))
+        return "".join(parts)
+    return ""
+
+
+def _extract_stream_chunk_text(chunk: Any) -> str:
+    if isinstance(chunk, dict):
+        if chunk.get("type") == "messages":
+            data = chunk.get("data")
+            if isinstance(data, tuple) and len(data) >= 1:
+                return _text_from_message_chunk(data[0])
+        return ""
+    if isinstance(chunk, tuple) and len(chunk) >= 1:
+        return _text_from_message_chunk(chunk[0])
+    return ""
+
+
+def iter_agent2_stream(agent2_input: dict[str, Any]) -> Iterator[str]:
+    """流式产出最终分析师（Agent2）的正文片段。"""
+    try:
+        stream_iter = agent2.stream(
+            agent2_input,
+            stream_mode="messages",
+            version="v2",
+        )
+    except TypeError:
+        stream_iter = agent2.stream(agent2_input, stream_mode="messages")
+
+    for chunk in stream_iter:
+        piece = _extract_stream_chunk_text(chunk)
+        if piece:
+            yield piece
+
+
+def iter_investment_analysis_stream(user_query: str) -> Iterator[str]:
+    """完整投研流程：先跑 Agent1，再流式输出 Agent2。"""
+    agent2_input = run_agent1_pipeline(user_query)
+    yield from iter_agent2_stream(agent2_input)
 
 
 def run_investment_analysis(user_query: str) -> str:
@@ -279,7 +330,7 @@ def run_investment_analysis(user_query: str) -> str:
     print("开始执行投研分析链...")
     print("=" * 50)
 
-    result = analysis_chain.invoke(user_query)
+    result = "".join(iter_investment_analysis_stream(user_query))
 
     print("\n" + "=" * 50)
     print("最终分析报告:")

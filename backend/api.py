@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
 import logging
-import traceback
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from backend.agent.investment_agent import run_investment_analysis
+from backend.agent.investment_agent import iter_agent2_stream, run_agent1_pipeline
 from backend.config import get_settings
 from backend.db import conversation_db as conv_db
 
@@ -80,26 +81,56 @@ class AnalysisRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 
-class AnalysisResponse(BaseModel):
-    result: str
+async def _ndjson_analysis_stream(
+    query: str,
+    *,
+    conversation_id: Optional[str] = None,
+) -> AsyncIterator[bytes]:
+    """NDJSON 流：delta 行增量输出，最后一行 type=done；错误为 type=error。"""
+    q = (query or "").strip()
+    if not q:
+        yield (json.dumps({"type": "error", "message": "查询内容不能为空"}, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+        return
 
+    if conversation_id is not None:
+        if not conv_db.conversation_exists(conversation_id):
+            yield (json.dumps({"type": "error", "message": "会话不存在"}, ensure_ascii=False) + "\n").encode(
+                "utf-8"
+            )
+            return
+        conv_db.append_message(conversation_id, "user", q)
+        conv_db.maybe_set_title_from_first_message(conversation_id, q)
 
-def _run_persisted_analysis(conversation_id: str, query: str) -> str:
-    """在已存在的会话中写入用户与助手消息；分析失败时仍写入助手错误文案并返回该文案。"""
-    if not conv_db.conversation_exists(conversation_id):
-        raise ValueError("conversation_not_found")
-    text = query.strip()
-    conv_db.append_message(conversation_id, "user", text)
-    conv_db.maybe_set_title_from_first_message(conversation_id, text)
     try:
-        result = run_investment_analysis(text)
+        agent2_input = await run_in_threadpool(run_agent1_pipeline, q)
     except Exception as e:
-        logger.exception("分析失败（已持久化用户消息）")
+        logger.exception("分析链前置阶段失败")
         err_text = f"发生错误：{e}"
-        conv_db.append_message(conversation_id, "assistant", err_text)
-        return err_text
-    conv_db.append_message(conversation_id, "assistant", result)
-    return result
+        if conversation_id is not None:
+            conv_db.append_message(conversation_id, "assistant", err_text)
+        yield (json.dumps({"type": "error", "message": err_text}, ensure_ascii=False) + "\n").encode("utf-8")
+        return
+
+    pieces: list[str] = []
+    try:
+        for piece in iter_agent2_stream(agent2_input):
+            if piece:
+                pieces.append(piece)
+                line = json.dumps({"type": "delta", "text": piece}, ensure_ascii=False) + "\n"
+                yield line.encode("utf-8")
+        full = "".join(pieces)
+        if conversation_id is not None:
+            conv_db.append_message(conversation_id, "assistant", full)
+        yield (json.dumps({"type": "done"}, ensure_ascii=False) + "\n").encode("utf-8")
+    except Exception as e:
+        logger.exception("分析流式输出失败")
+        partial = "".join(pieces)
+        err_text = (partial + f"\n\n（输出中断：{e}）") if partial else f"发生错误：{e}"
+        if conversation_id is not None:
+            conv_db.append_message(conversation_id, "assistant", err_text)
+        yield (json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 @app.get("/health")
@@ -175,42 +206,32 @@ async def delete_conversation(conversation_id: str):
     return {"ok": True}
 
 
-@app.post("/conversations/{conversation_id}/messages", response_model=AnalysisResponse)
+@app.post("/conversations/{conversation_id}/messages")
 async def post_conversation_message(conversation_id: str, body: ConversationMessageCreate):
-    try:
-        result = await run_in_threadpool(
-            _run_persisted_analysis, conversation_id, body.content
-        )
-    except ValueError as e:
-        if str(e) == "conversation_not_found":
-            raise HTTPException(status_code=404, detail="会话不存在")
-        raise HTTPException(status_code=400, detail=str(e))
-    return AnalysisResponse(result=result)
+    if not conv_db.conversation_exists(conversation_id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return StreamingResponse(
+        _ndjson_analysis_stream(body.content, conversation_id=conversation_id),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-@app.post("/analyze", response_model=AnalysisResponse)
+@app.post("/analyze")
 async def analyze(req: AnalysisRequest):
     if req.conversation_id:
-        try:
-            result = await run_in_threadpool(
-                _run_persisted_analysis, req.conversation_id, req.query
-            )
-            logger.info("分析完成（已写入会话 %s）", req.conversation_id)
-            return AnalysisResponse(result=result)
-        except ValueError as e:
-            if str(e) == "conversation_not_found":
-                raise HTTPException(status_code=404, detail="会话不存在")
-            raise HTTPException(status_code=400, detail=str(e))
-
-    try:
-        logger.info("收到分析请求: %s", req.query)
-        result = await run_in_threadpool(run_investment_analysis, req.query)
-        logger.info("分析完成")
-        return AnalysisResponse(result=result)
-    except Exception as e:
-        error_traceback = traceback.format_exc()
-        logger.error("分析失败: %s\n%s", str(e), error_traceback)
-        raise HTTPException(
-            status_code=500,
-            detail=f"{str(e)}\n\n详细堆栈:\n{error_traceback}",
+        if not conv_db.conversation_exists(req.conversation_id):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        logger.info("分析请求（会话 %s）", req.conversation_id)
+        return StreamingResponse(
+            _ndjson_analysis_stream(req.query, conversation_id=req.conversation_id),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    logger.info("收到分析请求: %s", req.query)
+    return StreamingResponse(
+        _ndjson_analysis_stream(req.query),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
