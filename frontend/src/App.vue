@@ -13,6 +13,44 @@ function renderAssistantMarkdown(text) {
   return DOMPurify.sanitize(typeof html === 'string' ? html : String(html))
 }
 
+/** 将 NDJSON 事件拼成与后端 format_stream_event_as_markdown 一致的 Markdown */
+function appendNdjsonEventToAssistantContent(msg, evt) {
+  if (!evt || typeof evt !== 'object') return
+  const t = evt.type
+  if (t === 'delta' && typeof evt.text === 'string') {
+    msg.content += evt.text
+    return
+  }
+  if (t === 'stage' && typeof evt.title === 'string' && evt.title) {
+    msg.content += `\n\n---\n\n### ${evt.title}\n\n`
+    return
+  }
+  if (t === 'tool') {
+    const name = typeof evt.name === 'string' ? evt.name : ''
+    const ev = evt.event
+    if (ev === 'start') {
+      const inp = typeof evt.input === 'string' ? evt.input.trim() : ''
+      if (inp) {
+        msg.content += `\n\n**工具** \`${name}\`\n\n\`\`\`json\n${inp}\n\`\`\`\n`
+      } else {
+        msg.content += `\n\n**工具** \`${name}\` …\n`
+      }
+      return
+    }
+    if (ev === 'args') {
+      const inp = typeof evt.input === 'string' ? evt.input.trim() : ''
+      if (inp) {
+        msg.content += `\n\n**工具参数** \`${name}\`\n\n\`\`\`json\n${inp}\n\`\`\`\n`
+      }
+      return
+    }
+    if (ev === 'end') {
+      const out = typeof evt.output === 'string' ? evt.output : ''
+      msg.content += `\n\n**工具结果** \`${name}\`\n\n\`\`\`\n${out}\n\`\`\`\n`
+    }
+  }
+}
+
 const sessions = ref([])
 const activeSessionId = ref('')
 const inputText = ref('')
@@ -163,8 +201,8 @@ const sendMessage = async () => {
         } catch {
           continue
         }
-        if (evt.type === 'delta' && typeof evt.text === 'string') {
-          assistantMsg.content += evt.text
+        if (evt.type === 'delta' || evt.type === 'stage' || evt.type === 'tool') {
+          appendNdjsonEventToAssistantContent(assistantMsg, evt)
           void scrollChatToBottom()
         } else if (evt.type === 'error') {
           const m = typeof evt.message === 'string' ? evt.message : JSON.stringify(evt.message)

@@ -8,9 +8,11 @@ from schemas import SearchtDate, StockInfo
 from tickflow import TickFlow
 import requests
 from .rag_system import retrieve_relevant_info
+from backend.config import get_settings
 
+settings = get_settings()
 
-tf = TickFlow(api_key="tk_6d7c6bd439a94e8d9c50ed4b5331652f")
+tf = TickFlow(api_key=settings.tickflow_api_key)
 
 @tool
 def get_current_datetime() -> str:

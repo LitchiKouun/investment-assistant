@@ -1,8 +1,12 @@
 import json
 from typing import Any, Iterator
-from backend.config import get_settings
+
 from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_openai import ChatOpenAI
+
+from backend.config import get_settings
+
 from . import tools
 
 # 角色：意图分析与信息提取 Agent（智能投研助手 · 一号Agent）
@@ -258,7 +262,201 @@ def run_agent1_pipeline(user_query: str) -> dict[str, Any]:
     return format_agent2_input(parsed)
 
 
+_TOOL_PREVIEW_LIMIT = 4000
+
+
+def _truncate_preview(text: str, max_len: int = _TOOL_PREVIEW_LIMIT) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "\n\n…（已截断）"
+
+
+def _open_agent_stream(agent: Any, agent_input: dict[str, Any]) -> Iterator[Any]:
+    """打开 LangGraph 流；优先 messages + updates + values（便于捕获完整 messages）。"""
+    attempts: list[dict[str, Any]] = [
+        {"stream_mode": ["messages", "updates", "values"], "version": "v2"},
+        {"stream_mode": ["messages", "updates"], "version": "v2"},
+        {"stream_mode": ["messages", "updates", "values"]},
+        {"stream_mode": ["messages", "updates"]},
+        {"stream_mode": "messages", "version": "v2"},
+        {"stream_mode": "messages"},
+    ]
+    last_err: Exception | None = None
+    for kwargs in attempts:
+        try:
+            return agent.stream(agent_input, **kwargs)
+        except TypeError as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return agent.stream(agent_input)
+
+
+def _iter_typed_stream_parts(raw_iter: Iterator[Any]) -> Iterator[tuple[str, Any]]:
+    """统一为 (mode, payload)，mode ∈ messages | updates | values。"""
+    for raw in raw_iter:
+        if isinstance(raw, dict) and raw.get("type") in ("messages", "updates", "values"):
+            yield str(raw["type"]), raw.get("data")
+            continue
+        if (
+            isinstance(raw, tuple)
+            and len(raw) == 2
+            and isinstance(raw[0], str)
+            and raw[0] in ("messages", "updates", "values")
+        ):
+            yield raw[0], raw[1]
+            continue
+        yield "messages", raw
+
+
+def iter_compiled_agent_event_dicts(
+    agent: Any,
+    agent_input: dict[str, Any],
+    *,
+    agent_key: str,
+    state_capture: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """
+    从 create_agent 编译图产出结构化流事件：
+    - delta: 模型正文 token
+    - tool: event=start|end，工具名与入参/出参摘要
+    若提供 state_capture，则在收到 values 时写入 state_capture 的 messages 列表。
+    """
+    stream_iter = _open_agent_stream(agent, agent_input)
+    tool_start_ids: set[str] = set()
+
+    for mode, data in _iter_typed_stream_parts(stream_iter):
+        if mode == "values" and state_capture is not None and isinstance(data, dict):
+            msgs = data.get("messages")
+            if msgs is not None:
+                state_capture["messages"] = list(msgs)
+            continue
+
+        if mode == "messages":
+            token: Any
+            if isinstance(data, tuple) and len(data) >= 1:
+                token = data[0]
+            else:
+                token = data
+            piece = _text_from_message_chunk(token)
+            if piece:
+                yield {"type": "delta", "agent": agent_key, "text": piece}
+            if isinstance(token, AIMessageChunk):
+                for ch in token.tool_call_chunks or []:
+                    if not isinstance(ch, dict):
+                        continue
+                    tid = str(ch.get("id") or "")
+                    name = ch.get("name")
+                    if not name or not tid or tid in tool_start_ids:
+                        continue
+                    tool_start_ids.add(tid)
+                    yield {
+                        "type": "tool",
+                        "agent": agent_key,
+                        "event": "start",
+                        "name": str(name),
+                        "input": "",
+                    }
+            continue
+
+        if mode == "updates" and isinstance(data, dict):
+            for _node, update in data.items():
+                if not isinstance(update, dict):
+                    continue
+                msgs = update.get("messages")
+                if not msgs:
+                    continue
+                for m in msgs:
+                    if isinstance(m, ToolMessage):
+                        nm = getattr(m, "name", None) or ""
+                        preview = _truncate_preview(str(m.content))
+                        yield {
+                            "type": "tool",
+                            "agent": agent_key,
+                            "event": "end",
+                            "name": str(nm),
+                            "output": preview,
+                        }
+                    elif isinstance(m, AIMessage) and m.tool_calls:
+                        for tc in m.tool_calls:
+                            tid = str(tc.get("id") or "")
+                            name = str(tc.get("name") or "")
+                            args = tc.get("args")
+                            try:
+                                inp = json.dumps(args, ensure_ascii=False, indent=2) if args is not None else ""
+                            except (TypeError, ValueError):
+                                inp = str(args) if args is not None else ""
+                            inp = _truncate_preview(inp, max_len=1500)
+                            if tid and tid not in tool_start_ids:
+                                tool_start_ids.add(tid)
+                                yield {
+                                    "type": "tool",
+                                    "agent": agent_key,
+                                    "event": "start",
+                                    "name": name,
+                                    "input": inp,
+                                }
+                            elif tid and tid in tool_start_ids and inp:
+                                yield {
+                                    "type": "tool",
+                                    "agent": agent_key,
+                                    "event": "args",
+                                    "name": name,
+                                    "input": inp,
+                                }
+
+
+def format_stream_event_as_markdown(ev: dict[str, Any]) -> str:
+    """将单条流事件格式化为可存入会话或展示的 Markdown。"""
+    t = ev.get("type")
+    if t == "stage":
+        title = ev.get("title") or ""
+        return f"\n\n---\n\n### {title}\n\n" if title else "\n\n"
+    if t == "delta":
+        return ev.get("text") or ""
+    if t == "tool":
+        evt = ev.get("event")
+        name = ev.get("name") or ""
+        if evt == "start":
+            inp = (ev.get("input") or "").strip()
+            if inp:
+                return f"\n\n**工具** `{name}`\n\n```json\n{inp}\n```\n"
+            return f"\n\n**工具** `{name}` …\n"
+        if evt == "args":
+            inp = (ev.get("input") or "").strip()
+            if not inp:
+                return ""
+            return f"\n\n**工具参数** `{name}`\n\n```json\n{inp}\n```\n"
+        if evt == "end":
+            out = ev.get("output") or ""
+            return f"\n\n**工具结果** `{name}`\n\n```\n{out}\n```\n"
+    return ""
+
+
+def iter_investment_analysis_event_dicts(user_query: str) -> Iterator[dict[str, Any]]:
+    """完整投研链：Agent1（含工具过程）→ Agent2，产出结构化事件字典。"""
+    agent1_input: dict[str, Any] = {"messages": [{"role": "user", "content": user_query}]}
+    capture1: dict[str, Any] = {}
+
+    yield {"type": "stage", "agent": "agent1", "title": "意图解析与数据获取（Agent 1）"}
+    for ev in iter_compiled_agent_event_dicts(agent1, agent1_input, agent_key="agent1", state_capture=capture1):
+        yield ev
+
+    msgs = capture1.get("messages")
+    if not msgs:
+        r1 = agent1.invoke(agent1_input)
+        msgs = r1["messages"]
+    parsed = parse_agent1_output({"messages": msgs})
+    agent2_input = format_agent2_input(parsed)
+
+    yield {"type": "stage", "agent": "agent2", "title": "走势分析（Agent 2）"}
+    yield from iter_compiled_agent_event_dicts(agent2, agent2_input, agent_key="agent2")
+
+
 def _text_from_message_chunk(token: Any) -> str:
+    if isinstance(token, ToolMessage):
+        return ""
     blocks = getattr(token, "content_blocks", None)
     if blocks:
         parts: list[str] = []
@@ -281,39 +479,19 @@ def _text_from_message_chunk(token: Any) -> str:
     return ""
 
 
-def _extract_stream_chunk_text(chunk: Any) -> str:
-    if isinstance(chunk, dict):
-        if chunk.get("type") == "messages":
-            data = chunk.get("data")
-            if isinstance(data, tuple) and len(data) >= 1:
-                return _text_from_message_chunk(data[0])
-        return ""
-    if isinstance(chunk, tuple) and len(chunk) >= 1:
-        return _text_from_message_chunk(chunk[0])
-    return ""
-
-
 def iter_agent2_stream(agent2_input: dict[str, Any]) -> Iterator[str]:
     """流式产出最终分析师（Agent2）的正文片段。"""
-    try:
-        stream_iter = agent2.stream(
-            agent2_input,
-            stream_mode="messages",
-            version="v2",
-        )
-    except TypeError:
-        stream_iter = agent2.stream(agent2_input, stream_mode="messages")
-
-    for chunk in stream_iter:
-        piece = _extract_stream_chunk_text(chunk)
-        if piece:
-            yield piece
+    for ev in iter_compiled_agent_event_dicts(agent2, agent2_input, agent_key="agent2"):
+        if ev.get("type") == "delta" and ev.get("text"):
+            yield str(ev["text"])
 
 
 def iter_investment_analysis_stream(user_query: str) -> Iterator[str]:
-    """完整投研流程：先跑 Agent1，再流式输出 Agent2。"""
-    agent2_input = run_agent1_pipeline(user_query)
-    yield from iter_agent2_stream(agent2_input)
+    """完整投研流程的 Markdown 片段流（阶段标题、工具块、模型正文）。"""
+    for ev in iter_investment_analysis_event_dicts(user_query):
+        md = format_stream_event_as_markdown(ev)
+        if md:
+            yield md
 
 
 def run_investment_analysis(user_query: str) -> str:

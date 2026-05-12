@@ -11,7 +11,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from backend.agent.investment_agent import iter_agent2_stream, run_agent1_pipeline
+from backend.agent.investment_agent import (
+    format_stream_event_as_markdown,
+    iter_investment_analysis_event_dicts,
+)
 from backend.config import get_settings
 from backend.db import conversation_db as conv_db
 
@@ -86,7 +89,7 @@ async def _ndjson_analysis_stream(
     *,
     conversation_id: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
-    """NDJSON 流：delta 行增量输出，最后一行 type=done；错误为 type=error。"""
+    """NDJSON 流：stage / tool / delta 等事件逐行 JSON，最后 type=done；错误为 type=error。"""
     q = (query or "").strip()
     if not q:
         yield (json.dumps({"type": "error", "message": "查询内容不能为空"}, ensure_ascii=False) + "\n").encode(
@@ -103,23 +106,14 @@ async def _ndjson_analysis_stream(
         conv_db.append_message(conversation_id, "user", q)
         conv_db.maybe_set_title_from_first_message(conversation_id, q)
 
-    try:
-        agent2_input = await run_in_threadpool(run_agent1_pipeline, q)
-    except Exception as e:
-        logger.exception("分析链前置阶段失败")
-        err_text = f"发生错误：{e}"
-        if conversation_id is not None:
-            conv_db.append_message(conversation_id, "assistant", err_text)
-        yield (json.dumps({"type": "error", "message": err_text}, ensure_ascii=False) + "\n").encode("utf-8")
-        return
-
     pieces: list[str] = []
     try:
-        for piece in iter_agent2_stream(agent2_input):
-            if piece:
-                pieces.append(piece)
-                line = json.dumps({"type": "delta", "text": piece}, ensure_ascii=False) + "\n"
-                yield line.encode("utf-8")
+        for ev in iter_investment_analysis_event_dicts(q):
+            md = format_stream_event_as_markdown(ev)
+            if md:
+                pieces.append(md)
+            line = json.dumps(ev, ensure_ascii=False) + "\n"
+            yield line.encode("utf-8")
         full = "".join(pieces)
         if conversation_id is not None:
             conv_db.append_message(conversation_id, "assistant", full)
